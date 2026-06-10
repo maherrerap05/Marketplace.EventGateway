@@ -52,6 +52,8 @@ public class MarketplaceQuery
         string fechaHoraRecogida,
         string fechaHoraDevolucion,
         [Service] CatalogoHttpClient catalogoClient,
+        [Service] IHttpClientFactory httpClientFactory,
+        [Service] IConfiguration configuration,
         CancellationToken cancellationToken)
     {
         if (!DateTime.TryParse(fechaHoraRecogida, out var fechaRecogida))
@@ -68,7 +70,54 @@ public class MarketplaceQuery
             fechaDevolucion,
             cancellationToken);
 
-        return dtos.Select(VehiculoType.FromDto).ToList();
+        if (!dtos.Any())
+            return [];
+
+        // Verificar disponibilidad real contra MS.Reservas via ESB para cada vehículo.
+        var esbBaseUrl = configuration["HttpClients:Esb:BaseUrl"]
+            ?? throw new InvalidOperationException("HttpClients:Esb:BaseUrl no configurado.");
+
+        var httpClient = httpClientFactory.CreateClient("Esb");
+        var jsonOptions = new System.Text.Json.JsonSerializerOptions
+        {
+            PropertyNameCaseInsensitive = true
+        };
+
+        var fechaRecogidaZ = fechaRecogida.ToString("yyyy-MM-ddTHH:mm:ssZ");
+        var fechaDevolucionZ = fechaDevolucion.ToString("yyyy-MM-ddTHH:mm:ssZ");
+
+        var vehiculosDisponibles = new List<VehiculoType>();
+
+        var tareas = dtos.Select(async dto =>
+        {
+            try
+            {
+                var url = $"api/v2/booking/reservas/{dto.id_vehiculo}/disponibilidad" +
+                          $"?fechaRecogida={Uri.EscapeDataString(fechaRecogidaZ)}" +
+                          $"&fechaDevolucion={Uri.EscapeDataString(fechaDevolucionZ)}" +
+                          $"&idLocalizacion={idLocalizacionRecogida}";
+
+                var response = await httpClient.GetAsync(url, cancellationToken);
+                if (!response.IsSuccessStatusCode)
+                    return (dto, disponible: false);
+
+                var json = await response.Content.ReadAsStringAsync(cancellationToken);
+                var wrapper = System.Text.Json.JsonSerializer.Deserialize<ApiResponse<DisponibilidadResponseDto>>(json, jsonOptions);
+                var disponible = wrapper?.Data?.Disponibilidad?.Disponible ?? false;
+                return (dto, disponible);
+            }
+            catch
+            {
+                return (dto, disponible: false);
+            }
+        });
+
+        var resultados = await Task.WhenAll(tareas);
+
+        return resultados
+            .Where(r => r.disponible)
+            .Select(r => VehiculoType.FromDto(r.dto))
+            .ToList();
     }
 
     /// <summary>
